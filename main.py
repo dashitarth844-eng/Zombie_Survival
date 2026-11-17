@@ -1,4 +1,3 @@
-
 import math
 import os
 import random
@@ -7,9 +6,9 @@ import sys
 import pygame
 import database
 
-from player import Player
-from zombie import Zombie
 from bullet import Bullet
+from player import CHARACTER_ARCHETYPES, Player
+from zombie import Zombie
 
 
 # ==================================================
@@ -45,11 +44,19 @@ BLUE = (65, 145, 240)
 YELLOW = (250, 200, 65)
 GREY = (155, 165, 180)
 CYAN = (70, 210, 230)
+PURPLE = (165, 105, 245)
+ORANGE = (245, 145, 55)
 
 font = pygame.font.Font(None, 30)
 small_font = pygame.font.Font(None, 23)
+tiny_font = pygame.font.Font(None, 19)
 title_font = pygame.font.Font(None, 76)
 subtitle_font = pygame.font.Font(None, 40)
+
+PAUSE_OVERLAY = pygame.Surface(
+    (SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA
+)
+PAUSE_OVERLAY.fill((0, 0, 0, 185))
 
 
 # ==================================================
@@ -97,23 +104,39 @@ player = None
 player_name = "Player"
 selected_character = "Soldier"
 selected_difficulty = "Easy"
+leaderboard_filter = "All"
 
 name_input_text = "Player"
 name_input_active = False
 
 zombies = []
 bullets = []
+pickups = []
+particles = []
+floating_texts = []
 
 wave = 1
 score = 0
 kills = 0
+combo_count = 0
+combo_expires_at = 0
+COMBO_WINDOW_MS = 2600
 
-last_shot_time = 0
-shoot_cooldown = 300
+# Active gameplay time (ms) excludes paused & wave-complete screens
+active_play_ms = 0
+last_shot_time = -1000
+damage_vignette_until = -1
 
 loading_start_time = 0
-game_start_time = 0
 game_saved = False
+
+# Wave Armory upgrade levels
+upgrade_levels = {
+    "damage": 0,
+    "fire_rate": 0,
+    "health": 0,
+    "speed": 0,
+}
 
 
 # ==================================================
@@ -138,12 +161,14 @@ def draw_background():
 
 def draw_button(
     text, x, y, width, height,
-    color=BLUE, text_color=WHITE
+    color=BLUE, text_color=WHITE,
+    button_font=font, enabled=True
 ):
     rect = pygame.Rect(x, y, width, height)
-    button_color = color
+    button_color = color if enabled else (45, 52, 66)
+    label_color = text_color if enabled else GREY
 
-    if rect.collidepoint(pygame.mouse.get_pos()):
+    if enabled and rect.collidepoint(pygame.mouse.get_pos()):
         button_color = tuple(
             min(channel + 25, 255)
             for channel in color
@@ -158,8 +183,8 @@ def draw_button(
         border_radius=10
     )
 
-    text_surface = font.render(
-        text, True, text_color
+    text_surface = button_font.render(
+        text, True, label_color
     )
     screen.blit(
         text_surface,
@@ -182,8 +207,15 @@ def draw_centered_text(
     )
 
 
+def format_duration(seconds):
+    mins, secs = divmod(max(0, int(seconds)), 60)
+    if mins > 0:
+        return f"{mins}m {secs:02d}s"
+    return f"{secs}s"
+
+
 # ==================================================
-# DIFFICULTY
+# DIFFICULTY & UPGRADE HELPERS
 # ==================================================
 
 def get_zombie_damage():
@@ -205,6 +237,195 @@ def get_available_zombie_types():
     return ["Normal", "Runner", "Tank"]
 
 
+def get_upgrade_cost(key):
+    base_costs = {
+        "damage": 6,
+        "fire_rate": 6,
+        "health": 5,
+        "speed": 6,
+    }
+    return base_costs[key] + upgrade_levels[key] * 5
+
+
+def apply_upgrade(key):
+    if player is None:
+        return False
+
+    cost = get_upgrade_cost(key)
+    if player.scrap < cost:
+        return False
+
+    player.scrap -= cost
+    upgrade_levels[key] += 1
+
+    if key == "damage":
+        player.bullet_damage += 5
+    elif key == "fire_rate":
+        player.shoot_cooldown = max(110, int(player.shoot_cooldown * 0.88))
+    elif key == "health":
+        player.max_health += 10
+        player.health = min(float(player.max_health), player.health + 30)
+    elif key == "speed":
+        player.speed = round(player.speed + 0.4, 2)
+
+    return True
+
+
+# ==================================================
+# PARTICLES, FLOATING TEXT & PICKUPS
+# ==================================================
+
+def spawn_particles(x, y, color, count=8, speed_range=(1.5, 4.5), radius=3):
+    for _ in range(count):
+        angle = random.uniform(0, math.tau)
+        speed = random.uniform(*speed_range)
+        particles.append({
+            "x": float(x),
+            "y": float(y),
+            "dx": math.cos(angle) * speed,
+            "dy": math.sin(angle) * speed,
+            "life": random.randint(14, 26),
+            "max_life": 26,
+            "color": color,
+            "radius": radius,
+        })
+
+
+def add_floating_text(x, y, text, color=WHITE):
+    floating_texts.append({
+        "x": float(x),
+        "y": float(y),
+        "text": text,
+        "color": color,
+        "life": 42,
+    })
+
+
+def maybe_spawn_pickup(x, y, zombie_type, is_elite):
+    chance = 0.20
+    if zombie_type == "Tank":
+        chance = 0.45
+    if is_elite:
+        chance = 0.85
+
+    if random.random() > chance:
+        return
+
+    kind = random.choices(
+        ["medkit", "rapid_fire", "spread_shot", "shield"],
+        weights=[35, 25, 20, 20],
+        k=1,
+    )[0]
+
+    pickups.append({
+        "x": float(x),
+        "y": float(y),
+        "kind": kind,
+        "radius": 15,
+        "expires_at": active_play_ms + 11000,
+    })
+
+
+def apply_pickup(pickup):
+    if player is None:
+        return
+
+    kind = pickup["kind"]
+    px, py = pickup["x"], pickup["y"]
+
+    if kind == "medkit":
+        healed = min(20.0, player.max_health - player.health)
+        player.health = min(float(player.max_health), player.health + 20.0)
+        label = f"+{int(healed)} HP" if healed > 0 else "FULL HP"
+        add_floating_text(px, py - 12, label, GREEN)
+        spawn_particles(px, py, GREEN, count=10)
+    elif kind == "rapid_fire":
+        player.rapid_fire_until = active_play_ms + 6500
+        add_floating_text(px, py - 12, "RAPID FIRE!", YELLOW)
+        spawn_particles(px, py, YELLOW, count=10)
+    elif kind == "spread_shot":
+        player.spread_shot_until = active_play_ms + 6500
+        add_floating_text(px, py - 12, "SPREAD SHOT!", PURPLE)
+        spawn_particles(px, py, PURPLE, count=10)
+    elif kind == "shield":
+        player.shield = min(40, player.shield + 15)
+        add_floating_text(px, py - 12, "SHIELD +15", CYAN)
+        spawn_particles(px, py, CYAN, count=10)
+
+
+def update_effects():
+    for particle in particles[:]:
+        particle["x"] += particle["dx"]
+        particle["y"] += particle["dy"]
+        particle["dx"] *= 0.93
+        particle["dy"] *= 0.93
+        particle["life"] -= 1
+        if particle["life"] <= 0:
+            particles.remove(particle)
+
+    for ft in floating_texts[:]:
+        ft["y"] -= 0.7
+        ft["life"] -= 1
+        if ft["life"] <= 0:
+            floating_texts.remove(ft)
+
+    for pickup in pickups[:]:
+        if active_play_ms >= pickup["expires_at"]:
+            pickups.remove(pickup)
+
+
+def draw_pickups():
+    pickup_styles = {
+        "medkit": (GREEN, "+"),
+        "rapid_fire": (YELLOW, "R"),
+        "spread_shot": (PURPLE, "S"),
+        "shield": (CYAN, "A"),
+    }
+
+    for pickup in pickups:
+        remaining = pickup["expires_at"] - active_play_ms
+        # Blink during the final 2.5 seconds before despawn
+        if remaining < 2500 and (remaining // 150) % 2 == 0:
+            continue
+
+        color, symbol = pickup_styles[pickup["kind"]]
+        bob = math.sin(active_play_ms * 0.008) * 3.0
+        cx = int(pickup["x"])
+        cy = int(pickup["y"] + bob)
+
+        pygame.draw.circle(screen, PANEL, (cx, cy), pickup["radius"])
+        pygame.draw.circle(screen, color, (cx, cy), pickup["radius"], 2)
+
+        sym_surf = small_font.render(symbol, True, color)
+        screen.blit(sym_surf, sym_surf.get_rect(center=(cx, cy)))
+
+
+def draw_particles_and_texts():
+    for particle in particles:
+        pygame.draw.circle(
+            screen,
+            particle["color"],
+            (int(particle["x"]), int(particle["y"])),
+            particle["radius"],
+        )
+
+    for ft in floating_texts:
+        surf = tiny_font.render(ft["text"], True, ft["color"])
+        screen.blit(
+            surf,
+            surf.get_rect(center=(int(ft["x"]), int(ft["y"]))),
+        )
+
+
+def draw_crosshair():
+    mx, my = pygame.mouse.get_pos()
+    pygame.draw.circle(screen, CYAN, (mx, my), 9, 1)
+    pygame.draw.line(screen, WHITE, (mx - 13, my), (mx - 5, my), 2)
+    pygame.draw.line(screen, WHITE, (mx + 5, my), (mx + 13, my), 2)
+    pygame.draw.line(screen, WHITE, (mx, my - 13), (mx, my - 5), 2)
+    pygame.draw.line(screen, WHITE, (mx, my + 5), (mx, my + 13), 2)
+
+
 # ==================================================
 # DATABASE CONNECTION
 # ==================================================
@@ -216,10 +437,7 @@ def save_current_game():
     if game_saved:
         return
 
-    survival_seconds = max(
-        0,
-        (pygame.time.get_ticks() - game_start_time) // 1000
-    )
+    survival_seconds = max(0, active_play_ms // 1000)
 
     try:
         database.save_game(
@@ -243,27 +461,77 @@ def save_current_game():
 # ==================================================
 
 def reset_game():
-    global player, zombies, bullets
-    global wave, score, kills, last_shot_time
-    global game_saved, game_start_time
+    global player, zombies, bullets, pickups, particles, floating_texts
+    global wave, score, kills, combo_count, combo_expires_at
+    global last_shot_time, active_play_ms, damage_vignette_until
+    global game_saved
 
     player = None
     zombies = []
     bullets = []
+    pickups = []
+    particles = []
+    floating_texts = []
 
     wave = 1
     score = 0
     kills = 0
-    last_shot_time = 0
+    combo_count = 0
+    combo_expires_at = 0
 
+    active_play_ms = 0
+    last_shot_time = -1000
+    damage_vignette_until = -1
     game_saved = False
-    game_start_time = 0
+
+    for key in upgrade_levels:
+        upgrade_levels[key] = 0
+
+
+def fire_player_weapon(target_x, target_y):
+    global last_shot_time
+
+    if player is None:
+        return
+
+    cooldown = player.get_effective_shoot_cooldown(active_play_ms)
+    if active_play_ms - last_shot_time < cooldown:
+        return
+
+    muzzle_dist = player.radius + 10
+    base_angle = math.atan2(target_y - player.y, target_x - player.x)
+    sx = player.x + math.cos(base_angle) * muzzle_dist
+    sy = player.y + math.sin(base_angle) * muzzle_dist
+
+    if player.has_spread_shot(active_play_ms):
+        angles = [base_angle - 0.16, base_angle, base_angle + 0.16]
+    else:
+        angles = [base_angle]
+
+    for angle in angles:
+        tx = sx + math.cos(angle) * 200
+        ty = sy + math.sin(angle) * 200
+        bullets.append(
+            Bullet(
+                sx,
+                sy,
+                tx,
+                ty,
+                damage=player.bullet_damage,
+                color=(190, 130, 255) if len(angles) > 1 else (255, 220, 50),
+            )
+        )
+
+    spawn_particles(sx, sy, YELLOW, count=4, speed_range=(1.0, 3.0), radius=2)
+    last_shot_time = active_play_ms
 
 
 def start_wave():
-    global zombies
+    global zombies, bullets, pickups
 
     zombies = []
+    bullets = []
+    pickups = []
 
     available_types = get_available_zombie_types()
     damage = get_zombie_damage()
@@ -282,7 +550,7 @@ def start_wave():
 
     random.shuffle(zombie_types)
 
-    for zombie_type in zombie_types:
+    for idx, zombie_type in enumerate(zombie_types):
         side = random.randint(0, 3)
 
         if side == 0:
@@ -298,26 +566,40 @@ def start_wave():
             x = SCREEN_WIDTH + 30
             y = random.randint(20, SCREEN_HEIGHT - 20)
 
+        # Spawn one Elite boss zombie every 5th wave
+        is_elite = (wave % 5 == 0) and idx == 0
+        elite_type = (
+            "Tank" if (is_elite and "Tank" in available_types) else zombie_type
+        )
+
         zombie = Zombie(
-            x, y,
+            x,
+            y,
             damage=damage,
-            zombie_type=zombie_type
+            zombie_type=elite_type,
+            is_elite=is_elite,
         )
 
         speed_increase = (wave - 1) * 0.08
 
-        if zombie_type == "Tank":
+        if elite_type == "Tank":
             zombie.speed += speed_increase * 0.5
         else:
             zombie.speed += speed_increase
 
         zombies.append(zombie)
 
+    if wave % 5 == 0:
+        add_floating_text(
+            SCREEN_WIDTH // 2, 130, f"WAVE {wave} - ALPHA BOSS INCOMING!", YELLOW
+        )
+    else:
+        add_floating_text(SCREEN_WIDTH // 2, 130, f"WAVE {wave}", CYAN)
+
 
 def begin_game():
     global player, player_name
-    global current_screen, loading_start_time
-    global game_start_time, game_saved
+    global current_screen, loading_start_time, game_saved
 
     player_name = name_input_text.strip() or "Player"
 
@@ -327,11 +609,10 @@ def begin_game():
         SCREEN_WIDTH // 2,
         SCREEN_HEIGHT // 2,
         player_name,
-        selected_character
+        selected_character,
     )
 
     loading_start_time = pygame.time.get_ticks()
-    game_start_time = loading_start_time
     game_saved = False
 
     current_screen = "loading"
@@ -505,7 +786,7 @@ def draw_zombie_information():
     )
 
     draw_centered_text(
-        "Keep moving and aim carefully!",
+        "Collect power-ups & press SPACE/SHIFT to dash!",
         535, small_font, GREY
     )
 
@@ -529,19 +810,19 @@ def draw_player_setup():
     draw_background()
 
     draw_centered_text(
-        "PLAYER SETUP", 150, title_font, CYAN
+        "PLAYER SETUP", 120, title_font, CYAN
     )
     draw_centered_text(
-        "Enter your name before starting",
-        215, font, GREY
+        "Enter your name and choose your survivor class",
+        180, font, GREY
     )
 
     screen.blit(
         font.render("Player Name:", True, WHITE),
-        (390, 290)
+        (390, 245)
     )
 
-    input_rect = pygame.Rect(570, 280, 320, 48)
+    input_rect = pygame.Rect(570, 235, 320, 48)
 
     pygame.draw.rect(
         screen, PANEL, input_rect, border_radius=8
@@ -564,13 +845,33 @@ def draw_player_setup():
 
     character_rect = draw_button(
         f"Character: {selected_character} (C to change)",
-        SCREEN_WIDTH // 2 - 210, 365,
+        SCREEN_WIDTH // 2 - 210, 315,
         420, 50, PANEL
+    )
+
+    # Archetype stat preview card
+    archetype = CHARACTER_ARCHETYPES[selected_character]
+    card_rect = pygame.Rect(SCREEN_WIDTH // 2 - 260, 382, 520, 110)
+    pygame.draw.rect(screen, PANEL, card_rect, border_radius=10)
+    pygame.draw.rect(screen, archetype["accent"], card_rect, 2, border_radius=10)
+
+    draw_centered_text(
+        archetype["description"],
+        412,
+        font,
+        archetype["accent"],
+    )
+    draw_centered_text(
+        f"HP: {archetype['max_health']}   |   Speed: {archetype['speed']}   |   "
+        f"Damage: {archetype['bullet_damage']}   |   Fire Rate: {archetype['shoot_cooldown']}ms",
+        458,
+        small_font,
+        WHITE,
     )
 
     start_rect = draw_button(
         "START SURVIVING",
-        SCREEN_WIDTH // 2 - 140, 455,
+        SCREEN_WIDTH // 2 - 140, 525,
         280, 55, GREEN
     )
 
@@ -616,7 +917,7 @@ def draw_health_bar():
         (x, y, width, height), border_radius=5
     )
 
-    ratio = max(0, min(1, player.health / 100))
+    ratio = max(0.0, min(1.0, player.health / player.max_health))
     if ratio > 0:
         pygame.draw.rect(
             screen,
@@ -630,39 +931,97 @@ def draw_health_bar():
         (x, y, width, height), 2, border_radius=5
     )
 
+    health_label = f"Health: {int(player.health)}/{player.max_health}"
+    if player.shield > 0:
+        health_label += f"  (+{int(player.shield)} Shield)"
+
     screen.blit(
-        small_font.render(
-            f"Health: {int(player.health)}/100",
-            True, WHITE
-        ),
+        small_font.render(health_label, True, WHITE),
         (x, y + 31)
     )
 
+    # Dash cooldown bar (right of health bar)
+    dash_x, dash_y = 285, 25
+    dash_w, dash_h = 140, 24
+    dash_ratio = player.get_dash_progress(active_play_ms)
 
-def draw_game():
+    pygame.draw.rect(
+        screen, PANEL, (dash_x, dash_y, dash_w, dash_h), border_radius=5
+    )
+    if dash_ratio > 0:
+        pygame.draw.rect(
+            screen,
+            CYAN if dash_ratio >= 1.0 else BLUE,
+            (dash_x, dash_y, int(dash_w * dash_ratio), dash_h),
+            border_radius=5,
+        )
+    pygame.draw.rect(
+        screen, BORDER, (dash_x, dash_y, dash_w, dash_h), 2, border_radius=5
+    )
+    dash_text = "DASH READY" if dash_ratio >= 1.0 else "RECHARGING"
+    dash_surf = tiny_font.render(dash_text, True, WHITE)
+    screen.blit(
+        dash_surf,
+        dash_surf.get_rect(center=(dash_x + dash_w // 2, dash_y + dash_h // 2)),
+    )
+
+
+def draw_active_buffs_and_combo():
+    if player is None:
+        return
+
+    buff_x = SCREEN_WIDTH - 25
+    buff_y = 25
+
+    active_buffs = []
+    if active_play_ms < player.rapid_fire_until:
+        secs = (player.rapid_fire_until - active_play_ms) / 1000.0
+        active_buffs.append((f"RAPID FIRE {secs:.1f}s", YELLOW))
+    if active_play_ms < player.spread_shot_until:
+        secs = (player.spread_shot_until - active_play_ms) / 1000.0
+        active_buffs.append((f"SPREAD SHOT {secs:.1f}s", PURPLE))
+
+    if combo_count >= 2 and active_play_ms < combo_expires_at:
+        mult = min(5, 1 + combo_count // 3)
+        active_buffs.append((f"COMBO {combo_count} (x{mult})", ORANGE))
+
+    for index, (label, color) in enumerate(active_buffs):
+        surf = small_font.render(label, True, color)
+        screen.blit(
+            surf,
+            surf.get_rect(topright=(buff_x, buff_y + index * 26)),
+        )
+
+
+def draw_game(show_crosshair=True):
     draw_background()
+
+    draw_pickups()
 
     for bullet in bullets:
         bullet.draw(screen)
 
     for zombie in zombies:
-        zombie.draw(screen)
+        zombie.draw(screen, active_play_ms)
 
     if player is not None:
-        player.draw(screen)
+        player.draw(screen, active_play_ms)
 
+    draw_particles_and_texts()
     draw_health_bar()
+    draw_active_buffs_and_combo()
 
+    scrap_value = player.scrap if player is not None else 0
     stats = small_font.render(
         f"Player: {player_name}   Wave: {wave}   "
         f"Score: {score}   Kills: {kills}   "
-        f"Zombies left: {len(zombies)}",
+        f"Scrap: {scrap_value}   Zombies left: {len(zombies)}",
         True, WHITE
     )
     screen.blit(stats, (25, 90))
 
     controls = small_font.render(
-        "WASD: Move | Mouse: Shoot | P: Pause",
+        "WASD: Move | Mouse: Aim & Shoot | Space/Shift: Dash | P: Pause",
         True, GREY
     )
     screen.blit(
@@ -672,9 +1031,20 @@ def draw_game():
         )
     )
 
+    if active_play_ms < damage_vignette_until:
+        pygame.draw.rect(
+            screen,
+            RED,
+            (0, 0, SCREEN_WIDTH, SCREEN_HEIGHT),
+            8,
+        )
+
+    if show_crosshair:
+        draw_crosshair()
+
 
 # ==================================================
-# WAVE COMPLETE
+# WAVE COMPLETE & FIELD ARMORY
 # ==================================================
 
 def draw_wave_complete():
@@ -682,29 +1052,77 @@ def draw_wave_complete():
 
     draw_centered_text(
         f"WAVE {wave} COMPLETED!",
-        210, title_font, GREEN
+        105, title_font, GREEN
     )
     draw_centered_text(
-        f"Current score: {score}",
-        275, subtitle_font, WHITE
+        f"Current score: {score}   |   Scrap available: {player.scrap if player else 0}",
+        165, subtitle_font, WHITE
     )
     draw_centered_text(
-        "Ready for the next wave?",
-        325, font, GREY
+        "FIELD ARMORY - Upgrade before the next wave (or press C)",
+        220, font, YELLOW
     )
+
+    upgrade_specs = [
+        ("damage", "DAMAGE +5", RED),
+        ("fire_rate", "FIRE RATE +12%", YELLOW),
+        ("health", "HEAL +30 & +10 HP", GREEN),
+        ("speed", "MOVE SPEED +0.4", CYAN),
+    ]
+
+    upgrade_rects = {}
+    card_w = 240
+    gap = 24
+    start_x = (SCREEN_WIDTH - (card_w * 4 + gap * 3)) // 2
+    card_y = 265
+
+    for idx, (key, title, color) in enumerate(upgrade_specs):
+        x = start_x + idx * (card_w + gap)
+        cost = get_upgrade_cost(key)
+        can_afford = player is not None and player.scrap >= cost
+
+        panel_rect = pygame.Rect(x, card_y, card_w, 150)
+        pygame.draw.rect(screen, PANEL, panel_rect, border_radius=12)
+        pygame.draw.rect(screen, BORDER, panel_rect, 2, border_radius=12)
+
+        t_surf = small_font.render(title, True, color)
+        screen.blit(
+            t_surf,
+            t_surf.get_rect(center=(x + card_w // 2, card_y + 32)),
+        )
+
+        lvl_surf = small_font.render(
+            f"Level {upgrade_levels[key]}", True, GREY
+        )
+        screen.blit(
+            lvl_surf,
+            lvl_surf.get_rect(center=(x + card_w // 2, card_y + 64)),
+        )
+
+        btn_rect = draw_button(
+            f"BUY ({cost} Scrap)",
+            x + 20,
+            card_y + 92,
+            card_w - 40,
+            42,
+            color=BLUE,
+            button_font=small_font,
+            enabled=can_afford,
+        )
+        upgrade_rects[key] = btn_rect
 
     next_rect = draw_button(
         "NEXT WAVE",
-        SCREEN_WIDTH // 2 - 140, 390,
+        SCREEN_WIDTH // 2 - 140, 470,
         280, 55, GREEN
     )
     menu_rect = draw_button(
         "MAIN MENU",
-        SCREEN_WIDTH // 2 - 140, 465,
+        SCREEN_WIDTH // 2 - 140, 545,
         280, 55, BLUE
     )
 
-    return next_rect, menu_rect
+    return next_rect, menu_rect, upgrade_rects
 
 
 # ==================================================
@@ -712,14 +1130,8 @@ def draw_wave_complete():
 # ==================================================
 
 def draw_paused():
-    draw_game()
-
-    overlay = pygame.Surface(
-        (SCREEN_WIDTH, SCREEN_HEIGHT),
-        pygame.SRCALPHA
-    )
-    overlay.fill((0, 0, 0, 185))
-    screen.blit(overlay, (0, 0))
+    draw_game(show_crosshair=False)
+    screen.blit(PAUSE_OVERLAY, (0, 0))
 
     draw_centered_text(
         "PAUSED", 240, title_font, YELLOW
@@ -747,25 +1159,26 @@ def draw_game_over():
     draw_background()
 
     draw_centered_text(
-        "GAME OVER", 180, title_font, RED
+        "GAME OVER", 150, title_font, RED
     )
     draw_centered_text(
         f"Final score: {score}",
-        250, subtitle_font, WHITE
+        225, subtitle_font, WHITE
     )
     draw_centered_text(
-        f"Zombies defeated: {kills}",
-        295, font, GREY
+        f"Wave reached: {wave}   |   Zombies defeated: {kills}   |   "
+        f"Survived: {format_duration(active_play_ms // 1000)}",
+        275, font, GREY
     )
 
     restart_rect = draw_button(
         "PLAY AGAIN",
-        SCREEN_WIDTH // 2 - 140, 370,
+        SCREEN_WIDTH // 2 - 140, 360,
         280, 55, GREEN
     )
     menu_rect = draw_button(
         "MAIN MENU",
-        SCREEN_WIDTH // 2 - 140, 445,
+        SCREEN_WIDTH // 2 - 140, 435,
         280, 55, BLUE
     )
 
@@ -780,18 +1193,50 @@ def draw_leaderboard():
     draw_background()
 
     draw_centered_text(
-        "LEADERBOARD", 65, title_font, YELLOW
+        "LEADERBOARD", 55, title_font, YELLOW
     )
 
     try:
-        records = database.get_top_scores(10)
+        total_games, best_score, total_kills, best_wave = (
+            database.get_stats_summary()
+        )
+        records = database.get_top_scores(10, difficulty=leaderboard_filter)
     except Exception as error:
+        total_games, best_score, total_kills, best_wave = (0, 0, 0, 0)
         records = []
         print("Could not load leaderboard:", error)
 
-    headers = ["Rank", "Player", "Difficulty", "Wave", "Score", "Kills"]
-    columns = [100, 280, 520, 760, 900, 1050]
-    header_y = 150
+    draw_centered_text(
+        f"Total Runs: {total_games}   |   High Score: {best_score}   |   "
+        f"Best Wave: {best_wave}   |   Total Kills: {total_kills}",
+        102,
+        small_font,
+        GREY,
+    )
+
+    # Difficulty filter tabs
+    filter_options = ["All", "Easy", "Medium", "Hard", "Extreme"]
+    filter_rects = {}
+    tab_w = 110
+    tab_gap = 14
+    tabs_start_x = (SCREEN_WIDTH - (tab_w * len(filter_options) + tab_gap * (len(filter_options) - 1))) // 2
+
+    for idx, diff_name in enumerate(filter_options):
+        tx = tabs_start_x + idx * (tab_w + tab_gap)
+        is_active = leaderboard_filter == diff_name
+        filter_rects[diff_name] = draw_button(
+            diff_name.upper(),
+            tx,
+            132,
+            tab_w,
+            34,
+            color=BLUE if is_active else PANEL,
+            button_font=small_font,
+        )
+
+    headers = ["Rank", "Player", "Difficulty", "Wave", "Score", "Kills", "Time"]
+    columns = [90, 220, 480, 670, 800, 940, 1080]
+    header_y = 190
 
     for heading, x in zip(headers, columns):
         surface = font.render(heading, True, CYAN)
@@ -799,8 +1244,8 @@ def draw_leaderboard():
 
     if not records:
         draw_centered_text(
-            "No saved games yet. Complete a game first.",
-            250, font, GREY
+            "No saved games yet for this filter. Complete a game first.",
+            300, font, GREY
         )
     else:
         for index, record in enumerate(records):
@@ -810,7 +1255,7 @@ def draw_leaderboard():
                 survival_seconds, played_at
             ) = record
 
-            y = 200 + index * 40
+            y = 235 + index * 38
 
             values = [
                 str(index + 1),
@@ -819,6 +1264,7 @@ def draw_leaderboard():
                 str(reached_wave),
                 str(saved_score),
                 str(saved_kills),
+                format_duration(survival_seconds),
             ]
 
             for value, x in zip(values, columns):
@@ -829,11 +1275,11 @@ def draw_leaderboard():
 
     back_rect = draw_button(
         "BACK TO MENU",
-        SCREEN_WIDTH // 2 - 140, 630,
+        SCREEN_WIDTH // 2 - 140, 635,
         280, 50, BLUE
     )
 
-    return back_rect
+    return back_rect, filter_rects
 
 
 # ==================================================
@@ -843,6 +1289,10 @@ def draw_leaderboard():
 running = True
 
 while running:
+    frame_dt_ms = clock.tick(FPS)
+
+    # Toggle custom cursor visibility during active combat
+    pygame.mouse.set_visible(current_screen != "game")
 
     for event in pygame.event.get():
 
@@ -861,6 +1311,8 @@ while running:
                 elif current_screen == "player_setup":
                     current_screen = "zombie_info"
                 elif current_screen == "difficulty":
+                    current_screen = "menu"
+                elif current_screen == "leaderboard":
                     current_screen = "menu"
 
             if (
@@ -895,6 +1347,18 @@ while running:
             elif current_screen == "game":
                 if event.key == pygame.K_p:
                     current_screen = "paused"
+                elif (
+                    event.key in (pygame.K_SPACE, pygame.K_LSHIFT, pygame.K_RSHIFT)
+                    and player is not None
+                ):
+                    if player.try_dash(active_play_ms):
+                        spawn_particles(
+                            player.x,
+                            player.y,
+                            CYAN,
+                            count=10,
+                            speed_range=(1.5, 4.0),
+                        )
 
             elif current_screen == "paused":
                 if event.key == pygame.K_p:
@@ -918,6 +1382,7 @@ while running:
                 event.key == pygame.K_q
                 and current_screen in ("game", "paused")
             ):
+                reset_game()
                 current_screen = "menu"
 
         elif event.type == pygame.MOUSEBUTTONDOWN:
@@ -967,7 +1432,10 @@ while running:
 
                 if input_rect.collidepoint(event.pos):
                     name_input_active = True
-                elif character_rect.collidepoint(event.pos):
+                else:
+                    name_input_active = False
+
+                if character_rect.collidepoint(event.pos):
                     selected_character = (
                         "Survivor"
                         if selected_character == "Soldier"
@@ -980,19 +1448,10 @@ while running:
 
             elif current_screen == "game":
                 if event.button == 1 and player is not None:
-                    now = pygame.time.get_ticks()
-
-                    if now - last_shot_time >= shoot_cooldown:
-                        bullets.append(
-                            Bullet(
-                                player.x, player.y,
-                                event.pos[0], event.pos[1]
-                            )
-                        )
-                        last_shot_time = now
+                    fire_player_weapon(event.pos[0], event.pos[1])
 
             elif current_screen == "wave_complete":
-                next_rect, menu_rect = draw_wave_complete()
+                next_rect, menu_rect, upgrade_rects = draw_wave_complete()
 
                 if next_rect.collidepoint(event.pos):
                     wave += 1
@@ -1001,6 +1460,11 @@ while running:
                 elif menu_rect.collidepoint(event.pos):
                     reset_game()
                     current_screen = "menu"
+                else:
+                    for key, btn_rect in upgrade_rects.items():
+                        if btn_rect.collidepoint(event.pos):
+                            apply_upgrade(key)
+                            break
 
             elif current_screen == "paused":
                 resume_rect, menu_rect = draw_paused()
@@ -1022,10 +1486,15 @@ while running:
                     current_screen = "menu"
 
             elif current_screen == "leaderboard":
-                back_rect = draw_leaderboard()
+                back_rect, filter_rects = draw_leaderboard()
 
                 if back_rect.collidepoint(event.pos):
                     current_screen = "menu"
+                else:
+                    for diff_name, rect in filter_rects.items():
+                        if rect.collidepoint(event.pos):
+                            leaderboard_filter = diff_name
+                            break
 
     # ==================================================
     # GAME UPDATES
@@ -1040,15 +1509,41 @@ while running:
             current_screen = "game"
 
     elif current_screen == "game" and player is not None:
+        active_play_ms += frame_dt_ms
 
-        player.move()
+        mouse_pos = pygame.mouse.get_pos()
+        player.update_aim(mouse_pos)
+
+        # Support holding left mouse button to fire smoothly
+        if pygame.mouse.get_pressed()[0]:
+            fire_player_weapon(mouse_pos[0], mouse_pos[1])
+
+        player.move(active_play_ms)
         player.keep_inside_screen(
             SCREEN_WIDTH, SCREEN_HEIGHT
         )
 
+        # Reset combo if window expired
+        if combo_count > 0 and active_play_ms >= combo_expires_at:
+            combo_count = 0
+
         for zombie in zombies:
-            zombie.move_towards_player(player)
-            zombie.attack_player(player)
+            zombie.move_towards_player(player, zombies)
+            dealt = zombie.attack_player(player, active_play_ms)
+            if dealt > 0:
+                damage_vignette_until = active_play_ms + 160
+                add_floating_text(
+                    player.x, player.y - 30, f"-{int(dealt)}", RED
+                )
+
+        # Collect pickups
+        for pickup in pickups[:]:
+            if (
+                math.hypot(player.x - pickup["x"], player.y - pickup["y"])
+                <= player.radius + pickup["radius"]
+            ):
+                apply_pickup(pickup)
+                pickups.remove(pickup)
 
         for bullet in bullets[:]:
             bullet.update()
@@ -1060,23 +1555,66 @@ while running:
                 continue
 
             for zombie in zombies[:]:
+                if id(zombie) in bullet.hit_zombie_ids:
+                    continue
+
                 distance = math.hypot(
                     bullet.x - zombie.x,
                     bullet.y - zombie.y
                 )
 
                 if distance <= zombie.radius + bullet.radius:
-                    zombie.health -= bullet.damage
+                    zombie.take_damage(bullet.damage, active_play_ms)
+                    bullet.hit_zombie_ids.add(id(zombie))
+                    spawn_particles(
+                        bullet.x,
+                        bullet.y,
+                        zombie.color,
+                        count=4,
+                        speed_range=(1.0, 3.0),
+                        radius=2,
+                    )
 
-                    if bullet in bullets:
+                    if bullet.pierce > 0:
+                        bullet.pierce -= 1
+                    elif bullet in bullets:
                         bullets.remove(bullet)
 
                     if zombie.health <= 0:
                         zombies.remove(zombie)
-                        score += 1
                         kills += 1
+                        combo_count += 1
+                        combo_expires_at = active_play_ms + COMBO_WINDOW_MS
+                        multiplier = min(5, 1 + combo_count // 3)
+                        gained_score = zombie.score_value * multiplier
+                        score += gained_score
+                        player.scrap += zombie.scrap_value
 
-                    break
+                        spawn_particles(
+                            zombie.x,
+                            zombie.y,
+                            zombie.color,
+                            count=12,
+                            speed_range=(1.5, 5.0),
+                            radius=3,
+                        )
+                        score_label = f"+{gained_score}"
+                        if multiplier > 1:
+                            score_label += f" (x{multiplier})"
+                        add_floating_text(
+                            zombie.x, zombie.y - 10, score_label, YELLOW
+                        )
+                        maybe_spawn_pickup(
+                            zombie.x,
+                            zombie.y,
+                            zombie.zombie_type,
+                            zombie.is_elite,
+                        )
+
+                    if bullet not in bullets:
+                        break
+
+        update_effects()
 
         if player.health <= 0:
             save_current_game()
@@ -1120,8 +1658,8 @@ while running:
         draw_leaderboard()
 
     pygame.display.flip()
-    clock.tick(FPS)
 
 
+pygame.mouse.set_visible(True)
 pygame.quit()
 sys.exit()

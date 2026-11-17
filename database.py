@@ -1,6 +1,5 @@
-
-import sqlite3
 import os
+import sqlite3
 from datetime import datetime
 
 # Store the database inside the project folder.
@@ -42,7 +41,8 @@ def save_game(
 ):
     """Save one completed game."""
     with get_connection() as connection:
-        connection.execute("""
+        connection.execute(
+            """
             INSERT INTO game_history (
                 player_name,
                 difficulty,
@@ -53,28 +53,47 @@ def save_game(
                 played_at
             )
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            player_name,
-            difficulty,
-            wave_reached,
-            score,
-            zombies_killed,
-            survival_seconds,
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        ))
+            """,
+            (
+                player_name,
+                difficulty,
+                wave_reached,
+                score,
+                zombies_killed,
+                survival_seconds,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            ),
+        )
 
 
-def get_top_scores(limit=10):
-    """Return the highest-scoring games."""
+def get_top_scores(limit=10, difficulty=None):
+    """Return the highest-scoring games, optionally filtered by difficulty."""
     with get_connection() as connection:
-        cursor = connection.execute("""
-            SELECT player_name, difficulty, wave_reached,
-                   score, zombies_killed, survival_seconds,
-                   played_at
-            FROM game_history
-            ORDER BY score DESC, wave_reached DESC
-            LIMIT ?
-        """, (limit,))
+        if difficulty and difficulty != "All":
+            cursor = connection.execute(
+                """
+                SELECT player_name, difficulty, wave_reached,
+                       score, zombies_killed, survival_seconds,
+                       played_at
+                FROM game_history
+                WHERE difficulty = ?
+                ORDER BY score DESC, wave_reached DESC, survival_seconds DESC
+                LIMIT ?
+                """,
+                (difficulty, limit),
+            )
+        else:
+            cursor = connection.execute(
+                """
+                SELECT player_name, difficulty, wave_reached,
+                       score, zombies_killed, survival_seconds,
+                       played_at
+                FROM game_history
+                ORDER BY score DESC, wave_reached DESC, survival_seconds DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
 
         return cursor.fetchall()
 
@@ -82,16 +101,36 @@ def get_top_scores(limit=10):
 def get_game_history(limit=20):
     """Return the most recently played games."""
     with get_connection() as connection:
-        cursor = connection.execute("""
+        cursor = connection.execute(
+            """
             SELECT player_name, difficulty, wave_reached,
                    score, zombies_killed, survival_seconds,
                    played_at
             FROM game_history
             ORDER BY id DESC
             LIMIT ?
-        """, (limit,))
+            """,
+            (limit,),
+        )
 
         return cursor.fetchall()
+
+
+def get_stats_summary():
+    """Return aggregate career statistics across all saved games."""
+    with get_connection() as connection:
+        cursor = connection.execute("""
+            SELECT
+                COUNT(*),
+                COALESCE(MAX(score), 0),
+                COALESCE(SUM(zombies_killed), 0),
+                COALESCE(MAX(wave_reached), 0)
+            FROM game_history
+        """)
+        row = cursor.fetchone()
+        if not row:
+            return (0, 0, 0, 0)
+        return row
 
 
 # Create the table when this module is imported.
